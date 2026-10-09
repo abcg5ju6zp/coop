@@ -4,6 +4,18 @@
 
 <!-- Add entries here as you ship; this heading is renamed to the version on the next release. -->
 
+- **Checkpoint restores publish transactionally.** The post-verification phase of
+  `RestoreWorkspaceCheckpoint` now journals an undoable commit before touching the live
+  workspace: it pins the original HEAD, tracked index tree, untracked files, task
+  projection and fork authority, and retains the verified candidate. A tree publish or
+  session-row failure rolls the workspace back to its pinned original and leaves the
+  operation retryable; after the session revision commits, a lost receipt is backfilled
+  from the committed row and worktree identity without re-covering the tree. Concurrent
+  turns, other restores, new file writes, and fork-authority changes block the final
+  switch; restart recovery continues, rolls back, or returns the completed result from
+  the journal phase. Empty checkpoints, idempotency replays, and the parked-runtime gate
+  behave exactly as before.
+
 ## 11.0.0
 
 - **Repository-local native history and host-only provider credentials.** Each project keeps its

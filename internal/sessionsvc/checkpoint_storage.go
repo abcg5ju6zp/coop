@@ -96,13 +96,19 @@ func (s *Service) removeSessionCheckpointArtifacts(ctx context.Context, sessionI
 		}
 		path := filepath.Join(s.stateRoot, "workspace-checkpoints", id+".checkpoint")
 		info, err := os.Lstat(path)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil || !info.Mode().IsRegular() {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			// The retained body is already gone; only the transaction directory may remain.
+		case err != nil || !info.Mode().IsRegular():
 			return errors.New("unsafe checkpoint artifact path")
+		default:
+			if err := os.Remove(path); err != nil {
+				return err
+			}
 		}
-		if err := os.Remove(path); err != nil {
+		// The operation is terminal above, so its rollback can never finish: drop the
+		// pinned snapshot/candidate too.
+		if err := s.removeCheckpointPublish(id); err != nil {
 			return err
 		}
 	}

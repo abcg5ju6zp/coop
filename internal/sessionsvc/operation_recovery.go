@@ -39,23 +39,7 @@ func (s *Service) reconcileInterruptedOperations(ctx context.Context, startup bo
 			continue
 		}
 		if op.Method == "RestoreWorkspaceCheckpoint" && op.State == session.OperationRunning {
-			var req RestoreWorkspaceCheckpointRequest
-			artifact, restoreErr := s.readWorkspaceCheckpointArtifact(ctx, op.ID)
-			if restoreErr == nil {
-				restoreErr = json.Unmarshal(op.Result, &req)
-			}
-			if restoreErr == nil {
-				var file *os.File
-				file, restoreErr = os.Open(artifact.path)
-				if restoreErr == nil {
-					_, restoreErr = file.Seek(artifact.offset, io.SeekStart)
-					if restoreErr == nil {
-						req.Stream = file
-						_, restoreErr = s.executeRestoreWorkspaceCheckpoint(ctx, op, req)
-					}
-					restoreErr = errors.Join(restoreErr, file.Close())
-				}
-			}
+			restoreErr := s.resumeInterruptedRestore(ctx, op)
 			unlock()
 			if restoreErr != nil {
 				s.log.Warn("checkpoint restore remains fenced", "operation_id", op.ID, "error", restoreErr)
@@ -121,6 +105,39 @@ func (s *Service) reconcileInterruptedOperations(ctx context.Context, startup bo
 		)
 	}
 	return nil
+}
+
+// resumeInterruptedRestore finishes one interrupted restore. A durable publish
+// transaction resumes straight from its journal (rollback, continued publish, or
+// receipt backfill); only an operation without one replays the retained body stream.
+func (s *Service) resumeInterruptedRestore(ctx context.Context, op session.Operation) error {
+	var req RestoreWorkspaceCheckpointRequest
+	if err := json.Unmarshal(op.Result, &req); err != nil {
+		return err
+	}
+	if txn, err := s.openCheckpointPublish(op.ID); err != nil {
+		return err
+	} else if txn != nil {
+		_, handled, err := s.resumeCheckpointPublishTxn(ctx, op, req)
+		if handled {
+			return err
+		}
+		// The retained candidate was lost: fall through to the retained-body replay.
+	}
+	artifact, err := s.readWorkspaceCheckpointArtifact(ctx, op.ID)
+	if err != nil {
+		return err
+	}
+	file, err := os.Open(artifact.path)
+	if err != nil {
+		return err
+	}
+	var streamErr error
+	if _, streamErr = file.Seek(artifact.offset, io.SeekStart); streamErr == nil {
+		req.Stream = file
+		_, streamErr = s.executeRestoreWorkspaceCheckpoint(ctx, op, req)
+	}
+	return errors.Join(streamErr, file.Close())
 }
 
 func (s *Service) reconcileCancelOperation(ctx context.Context, op session.Operation) (bool, error) {

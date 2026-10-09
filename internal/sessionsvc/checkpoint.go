@@ -106,12 +106,68 @@ func (s *Service) executeRestoreWorkspaceCheckpoint(ctx context.Context, op sess
 			Code: session.CodeInvalidRequest, Detail: "historical checkpoint v1 is read-only; restore requires complete repository custody in v2",
 		})
 	}
+	// A durable publish transaction resumes from its journal without the body
+	// stream; missing candidate custody falls back to the retained-body replay.
+	if bound, handled, err := s.resumeCheckpointPublishTxn(ctx, op, req); handled {
+		return bound, err
+	}
 	if req.Stream == nil {
 		return session.Session{}, s.failServiceOperation(ctx, op.ID, &session.Error{
 			Code: session.CodeInvalidRequest, Detail: "checkpoint body is required",
 		})
 	}
 	return s.restoreStreamedCheckpoint(ctx, op, req)
+}
+
+// failRestoreOperation maps a restore error the same way restoreStreamedCheckpoint's
+// fail closure does: a reserved operation is terminalized, a running one stays
+// recoverable because its publish journal still owns the workspace's direction.
+func (s *Service) failRestoreOperation(ctx context.Context, op session.Operation, err error) error {
+	if op.State == session.OperationReserved {
+		return s.failServiceOperation(ctx, op.ID, err)
+	}
+	return wrapServiceOperationError(op.ID, &session.Error{
+		Code: session.CodeOperationUncertain, Detail: "checkpoint restore must finish before execution: " + err.Error(),
+	})
+}
+
+// resumeCheckpointPublishTxn continues an operation that already committed a
+// publish journal. handled=false means no transaction exists, or its retained
+// candidate was lost and the caller should replay from the retained body.
+func (s *Service) resumeCheckpointPublishTxn(
+	ctx context.Context,
+	op session.Operation,
+	req RestoreWorkspaceCheckpointRequest,
+) (_ session.Session, handled bool, _ error) {
+	txn, err := s.openCheckpointPublish(op.ID)
+	if err != nil {
+		return session.Session{}, true, s.failRestoreOperation(ctx, op, err)
+	}
+	if txn == nil {
+		return session.Session{}, false, nil
+	}
+	if req.SessionID != "" && req.SessionID != txn.j.SessionID {
+		err := &session.Error{Code: session.CodeInvalidSessionState, Detail: "checkpoint resume names another session"}
+		return session.Session{}, true, s.failRestoreOperation(ctx, op, err)
+	}
+	if len(txn.j.Checkpoint) != 0 {
+		descriptor, marshalErr := json.Marshal(req.Checkpoint)
+		if marshalErr != nil || !bytes.Equal(descriptor, txn.j.Checkpoint) {
+			err := &session.Error{Code: session.CodeOperationIntentConflict, Detail: "checkpoint resume names another checkpoint"}
+			return session.Session{}, true, s.failRestoreOperation(ctx, op, err)
+		}
+	}
+	bound, err := txn.run(ctx, "", false)
+	if errors.Is(err, errCheckpointCandidateMissing) {
+		// The durable journal survived but its candidate did not. Drop the
+		// transaction and let the retained-body replay rebuild it.
+		_ = os.RemoveAll(txn.dir)
+		return session.Session{}, false, nil
+	}
+	if err != nil {
+		return session.Session{}, true, s.failRestoreOperation(ctx, op, err)
+	}
+	return bound, true, nil
 }
 
 func (s *Service) validateRestoreWorkspaceSession(

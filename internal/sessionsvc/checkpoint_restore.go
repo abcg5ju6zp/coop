@@ -139,29 +139,18 @@ func (s *Service) restoreStreamedCheckpoint(ctx context.Context, op session.Oper
 	if s.testDuringRestoreFiles != nil {
 		s.testDuringRestoreFiles()
 	}
-	branch, err := sessionWorkspaceGitText(sess.Workspace, 257, "symbolic-ref", "--quiet", "--short", "HEAD")
-	if err != nil || strings.TrimSpace(string(branch)) != sess.ForkName {
-		return fail(errors.New("replacement workspace branch authority changed"))
-	}
-	if err := materializeCheckpoint(ctx, sess.Repository, repository, sess.Workspace, req.Checkpoint, manifest, members); err != nil {
-		return fail(err)
-	}
-	if err := s.validateSessionForkAuthority(ctx, sess); err != nil {
-		return fail(err)
-	}
-	if _, err := verifyStreamedCheckpoint(ctx, sess, req.Checkpoint, manifest); err != nil {
-		return fail(err)
-	}
-	bound, err := s.store.RestoreWorkspaceTask(ctx, sess.ID, req.ExpectedRevision, req.Checkpoint.BaseRevision, binding)
+	// Pin the original workspace and the verified candidate in a durable
+	// transaction; run() performs the undoable publish (materialize → fence →
+	// session-row CAS → receipt). The stage moves into the transaction here, so the
+	// deferred stage cleanup below becomes a no-op.
+	txn, existed, err := s.prepareCheckpointPublish(ctx, op, sess, req.Checkpoint, manifest)
 	if err != nil {
 		return fail(err)
 	}
-	result, _ := json.Marshal(bound)
-	if err := s.store.CompleteOperation(ctx, op.ID, "session", bound.ID, result); err != nil {
+	bound, err := txn.run(ctx, stage, !existed)
+	if err != nil {
 		return fail(err)
 	}
-	// A succeeded receipt replays from the journal, not the now-unused body.
-	_ = os.Remove(filepath.Join(s.stateRoot, "workspace-checkpoints", op.ID+".checkpoint"))
 	return bound, nil
 }
 

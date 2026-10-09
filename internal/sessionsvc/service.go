@@ -365,6 +365,12 @@ type Service struct {
 	runtimeChanged          chan struct{}
 	restoring               map[string]bool // sessions whose workspace a restore is rewriting right now
 	testDuringRestoreFiles  func()          // test seam: runs while the restore holds the runtime and rewrites files
+	// testAfterRestorePublished runs after the candidate is published to the tree and
+	// before the final fence and session-row switch: the crash/conflict window. nil in production.
+	testAfterRestorePublished func()
+	// testCrashAfterRestorePublished simulates process death after the published
+	// phase was journaled (the tree is left switched, no rollback). nil in production.
+	testCrashAfterRestorePublished func() bool
 	runtimeCleanupMu        sync.Mutex
 	runtimeCleanupCursor    int
 	runtimeCleanupStampMu   sync.Mutex

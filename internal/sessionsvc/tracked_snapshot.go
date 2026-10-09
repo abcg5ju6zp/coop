@@ -26,6 +26,15 @@ func streamSessionTrackedPatch(ctx context.Context, workspace, base string, outp
 }
 
 func withSessionTrackedTree(ctx context.Context, workspace string, action func(string, []string) error) error {
+	return withSessionTrackedTreeGitDir(ctx, workspace, func(tree, _ string, env []string) error {
+		return action(tree, env)
+	})
+}
+
+// withSessionTrackedTreeGitDir additionally exposes the private index
+// repository's git dir, so a caller can pin the written tree into another
+// object store before the temporary repository is removed.
+func withSessionTrackedTreeGitDir(ctx context.Context, workspace string, action func(string, string, []string) error) error {
 	head, err := sessionWorkspaceCommitContext(ctx, workspace, "HEAD")
 	if err != nil {
 		return err
@@ -99,6 +108,15 @@ func withSessionTrackedTree(ctx context.Context, workspace string, action func(s
 		if err != nil || truncated {
 			return errors.New("cannot resolve tracked snapshot tree")
 		}
-		return action(strings.TrimSpace(string(tree)), env)
+		return action(strings.TrimSpace(string(tree)), privateGitDir(env), env)
 	})
+}
+
+func privateGitDir(env []string) string {
+	for _, entry := range env {
+		if value, ok := strings.CutPrefix(entry, "GIT_DIR="); ok {
+			return value
+		}
+	}
+	return ""
 }

@@ -843,7 +843,11 @@ func TestReplacementWorkspaceRestoresExactCheckpointBeforeBindingTheDurableTask(
 		if _, err := service.RestoreWorkspaceCheckpoint(ctx, "restore-interrupted-new-key", req); err == nil {
 			t.Fatal("another operation bypassed the recovery fence")
 		}
-		writeFile(replacement.Workspace, "tracked.txt", "partial restore must be replaced\n", 0644)
+		// The session row crossed its confirmation point before the receipt was
+		// lost. Recovery only backfills the receipt: writes that land on the now
+		// committed workspace afterwards are the owner's and must not be re-covered.
+		writeFile(replacement.Workspace, "canary-after-commit.txt", "written after the commit point\n", 0644)
+		writeFile(replacement.Workspace, "tracked.txt", "written after the commit point\n", 0644)
 		if _, err := db.Exec("DROP TRIGGER interrupt_restore_completion"); err != nil {
 			t.Fatal(err)
 		}
@@ -854,11 +858,19 @@ func TestReplacementWorkspaceRestoresExactCheckpointBeforeBindingTheDurableTask(
 		if err != nil || op.State != session.OperationSucceeded {
 			t.Fatalf("startup recovery did not complete restore: %+v, %v", op, err)
 		}
-		if got, err := os.ReadFile(filepath.Join(replacement.Workspace, "tracked.txt")); err != nil || string(got) != "restored change\n" {
-			t.Fatalf("recovery lost exact workspace: %q, %v", got, err)
+		for _, canary := range []string{"canary-after-commit.txt", "tracked.txt"} {
+			if got, err := os.ReadFile(filepath.Join(replacement.Workspace, canary)); err != nil || string(got) != "written after the commit point\n" {
+				t.Fatalf("receipt backfill re-covered the workspace (%s): %q, %v", canary, got, err)
+			}
+		}
+		if got, err := sessionWorkspaceCommit(replacement.Workspace, "HEAD"); err != nil || got != captured.Checkpoint.CommittedRevision {
+			t.Fatalf("receipt backfill moved the workspace HEAD: %s, %v", got, err)
 		}
 		if _, err := os.Stat(filepath.Join(service.stateRoot, "workspace-checkpoints", op.ID+".checkpoint")); !os.IsNotExist(err) {
 			t.Fatalf("completed restore retained its redundant body: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(service.stateRoot, "workspace-checkpoints", op.ID+".publish")); !os.IsNotExist(err) {
+			t.Fatalf("completed restore retained its publish journal: %v", err)
 		}
 		if _, err := service.Store().SubmitTurn(ctx, "restore-recovery-turn", turn); err != nil {
 			t.Fatalf("recovery did not release admission: %v", err)
