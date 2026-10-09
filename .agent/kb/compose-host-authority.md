@@ -2,8 +2,8 @@
 name: compose-host-authority
 description: sibling Compose execution uses a validated private snapshot and explicit values rather than ambient host imports
 subsystem: box/services
-sources: [internal/box/composecheck.go, internal/box/services.go, internal/box/serviceports.go, internal/box/service_observation.go, internal/runtime/service_observation.go, internal/runtime/mounts.go, internal/runtime/compose.go, internal/box/run.go, internal/box/serviceshadow.go, internal/box/serviceapproval.go, internal/box/serviceimages.go, internal/box/serviceanchor.go, internal/box/sweep.go, internal/forkspace/execution.go]
-updated: 2026-09-23
+sources: [internal/box/composecheck.go, internal/box/services.go, internal/box/downplan.go, internal/box/serviceports.go, internal/box/service_observation.go, internal/runtime/service_observation.go, internal/runtime/mounts.go, internal/runtime/compose.go, internal/runtime/docker_down.go, internal/box/run.go, internal/box/serviceshadow.go, internal/box/serviceapproval.go, internal/box/serviceanchor.go, internal/box/sweep.go, internal/forkspace/execution.go]
+updated: 2026-10-09
 ---
 
 Sibling service definitions are agent-writable but execute on the host daemon. `readValidatedCompose`
@@ -116,7 +116,29 @@ ownership label AND the project's unused networks (`RemoveProjectNetworks`); `Re
 like coop's (`^coop-…-<8hex>$`) — never a human's compose project. "Unused" counts stopped
 containers as users (`ps -a --filter network=`), because they reconnect on the next start.
 
+`coop down --delete-volumes` is a persisted, resumable manifest (`downplan.go`), not live
+enumeration plus a batched rm. At confirmation the exact daemon endpoint+ID (`FreezeCompose`),
+every project-labelled container id, project network id, and each confirmed volume's
+`CreatedAt`+mountpoint are frozen with the validated Compose bytes into
+`<state>/down-plans/<project>.json`, atomically, BEFORE the first removal. Execution binds the
+frozen endpoint; a different daemon ID there re-binds recovery-only and reconciles each object.
+Containers come down via Compose run against a snapshot of the FROZEN bytes without
+`--remove-orphans`, so a post-confirmation Compose edit cannot widen scope; frozen container ids
+still present are removed by exact id, new containers are never touched; frozen networks are
+removed only when unused; each volume is inspected first — absent ⇒ done, same identity ⇒ bound
+`volume rm` proven by positive absence, different `CreatedAt`/mountpoint or non-local driver ⇒
+`refused` and kept. Progress is saved per resource, so Compose partial failure re-verifies
+reality, an unreachable daemon preserves the whole pending todo, and an interrupted process
+continues on the next same command without re-asking; nothing pending removes the record, so a
+refused or newly appeared volume waits for the next explicit confirmation. Plain `coop down`
+never reads or writes the manifest (it only notes a pending one); external volumes stay out via
+the project-label enumeration.
+
 ## Changelog
+- 2026-10-09: `coop down --delete-volumes` freezes daemon/container/network/volume identities and
+  the validated Compose bytes into a persisted down-plan, verifies every removal, resumes after
+  partial failure/unreachable daemon/interruption on the same command, and refuses
+  identity-reused volumes; plain down and external-volume/owner-scope guarantees unchanged.
 - 2026-09-23: verified exact-image approval and private start override against service review,
   automatic and filtered start paths; only elevated consumers are pinned, and v4 grants fail closed.
 - 2026-09-23: repository-anchored secret and external-volume approvals, terminal-only volume

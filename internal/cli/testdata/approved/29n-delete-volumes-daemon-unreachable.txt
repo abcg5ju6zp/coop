@@ -1,0 +1,18 @@
+Resuming the volume deletion you already confirmed; the list is frozen and new volumes are not added:
+  - coop-atlas_pgdata — database data
+  - coop-atlas_redisdata — Redis data
+
+Stopping services from .agent/compose.yml
+
+✗ Could not finish stopping services and deleting their data
+
+      Docker is unavailable.
+
+  Pending — confirmed but still present:
+    - db (container)
+    - redis (container)
+    - coop-atlas_default (network)
+    - coop-atlas_pgdata (volume)
+    - coop-atlas_redisdata (volume)
+
+  Start Docker, then run coop down --delete-volumes again to continue the confirmed deletion.

@@ -1,0 +1,22 @@
+Resuming the volume deletion you already confirmed; the list is frozen and new volumes are not added:
+  - coop-atlas_pgdata — database data
+  - coop-atlas_redisdata — Redis data
+
+Stopping services from .agent/compose.yml
+
+[Compose output]
+
+✗ Some confirmed volumes were not deleted
+
+      A volume's identity changed after confirmation, so different data under the same name was kept.
+
+  Deleted:
+    - db (container)
+    - redis (container)
+    - coop-atlas_default (network)
+    - coop-atlas_pgdata (volume)
+
+  Refused — identity changed since confirmation:
+    - coop-atlas_redisdata (volume)
+
+  Review the current volumes, then run coop down --delete-volumes to delete them with a fresh confirmation.

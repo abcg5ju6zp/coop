@@ -1,0 +1,9 @@
+Resuming the volume deletion you already confirmed; the list is frozen and new volumes are not added:
+  - coop-atlas_pgdata — database data
+  - coop-atlas_redisdata — Redis data
+
+Stopping services from .agent/compose.yml
+
+[Compose output]
+
+✓ Services stopped; 2 volumes deleted

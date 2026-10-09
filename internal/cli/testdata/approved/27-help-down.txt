@@ -13,5 +13,8 @@ OPTIONS
 Coop names the volumes before asking; press Enter to cancel.
 Without a terminal, deletion requires --yes.
 External volumes and files mounted from the project are kept.
+The confirmed services, networks and volumes are frozen before removal, so a
+failed or interrupted deletion resumes when you run the same command again.
+A volume recreated under a confirmed name is refused and needs a fresh confirmation.
 
 Start again: coop up

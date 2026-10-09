@@ -344,18 +344,39 @@ func (a *app) cmdDown(args []string) (int, error) {
 			"Use Docker for this project's services.")
 	}
 	file := box.ComposeFileAt(repo, p.ComposeRel())
-	if file == "" {
-		return 1, reported("Could not stop services",
-			fmt.Sprintf("%s does not exist.", p.ComposeRel()),
-			"Restore the Compose file, then run coop down again.")
-	}
 	rel, _ := filepath.Rel(repo, file)
-	var targets []box.ServiceVolume
-	if deleteVolumes {
+	if !deleteVolumes {
+		if file == "" {
+			return 1, reported("Could not stop services",
+				fmt.Sprintf("%s does not exist.", p.ComposeRel()),
+				"Restore the Compose file, then run coop down again.")
+		}
+		// A plain stop never enters the volume manifest, but a confirmed deletion left pending by
+		// an earlier interrupted run is worth naming before the reader assumes the data is gone.
+		if box.PendingDownPlan(repo) {
+			ui.Note("A confirmed --delete-volumes deletion is still pending. Run coop down --delete-volumes to continue it.")
+			ui.Note("")
+		}
+		return a.downCompose(repo, file, rel, false)
+	}
+	// The destructive path is manifest-driven: the confirmed scope is frozen and persisted
+	// before removal, and an interrupted or partial run resumes from the record instead of
+	// re-enumerating a changed world.
+	plan, loadErr := box.LoadDownPlan(repo)
+	if loadErr != nil {
+		return 1, reported("Could not stop services", sentence(firstLine(loadErr)),
+			"Resolve the record, then run coop down --delete-volumes again.")
+	}
+	if plan == nil {
+		if file == "" {
+			return 1, reported("Could not stop services",
+				fmt.Sprintf("%s does not exist.", p.ComposeRel()),
+				"Restore the Compose file, then run coop down again.")
+		}
 		// Every target is resolved and shown BEFORE anything is removed: the person confirming a
 		// permanent deletion is confirming this list, so an unanswerable runtime stops the command
 		// rather than deleting against a guess.
-		targets, err = box.ServiceVolumes(a.rt, repo, os.Stderr)
+		targets, err := box.ServiceVolumes(a.rt, repo, os.Stderr)
 		if err != nil {
 			return 1, reported("Could not determine which service volumes would be deleted",
 				fmt.Sprintf("%s did not return the project's volume information.", runtimeTitle(a.rt.Name)),
@@ -364,16 +385,53 @@ func (a *app) cmdDown(args []string) (int, error) {
 		if code, err := confirmVolumeDeletion(targets, yes); err != nil {
 			return code, err
 		}
+		if len(targets) == 0 {
+			// Nothing to freeze: keep the ordinary stop, whose output already says data was kept.
+			return a.downCompose(repo, file, rel, true)
+		}
+		// Freeze identities and persist the manifest BEFORE the first removal. A failure here has
+		// removed nothing.
+		plan, err = box.PrepareDownPlan(context.Background(), a.rt, repo, file, targets)
+		if err != nil {
+			var refused *box.ComposeRefused
+			if errors.As(err, &refused) {
+				return 1, composeRefusal("Could not stop services from "+rel, rel, refused.Err, "coop down")
+			}
+			return 1, reported("Could not determine which service volumes would be deleted",
+				sentence(firstLine(err)),
+				fmt.Sprintf("Check %s, then run coop down --delete-volumes again.", runtimeTitle(a.rt.Name)))
+		}
+	} else {
+		noticePendingVolumeDeletion(plan)
+		if rel == "" {
+			rel = plan.File
+		}
 	}
 	ui.Note("Stopping services from %s", rel)
 	ui.Note("")
 	out, errOut := &seenWriter{w: os.Stdout}, &seenWriter{w: os.Stderr}
-	deleting := deleteVolumes && len(targets) > 0
-	if deleting {
-		err = box.DownServicesFileVolumes(a.rt, repo, file, targets, out, errOut, box.ConfigExposureRoots(a.cfg)...)
-	} else {
-		err = box.DownServicesFile(a.rt, repo, file, false, out, errOut, box.ConfigExposureRoots(a.cfg)...)
+	exec, err := box.ExecuteDownPlan(context.Background(), a.rt, repo, plan, out, errOut, box.ConfigExposureRoots(a.cfg)...)
+	if out.seen || errOut.seen {
+		ui.Note("")
 	}
+	if err != nil {
+		var refused *box.ComposeRefused
+		if errors.As(err, &refused) {
+			return 1, composeRefusal("Could not stop services from "+rel, rel, refused.Err, "coop down")
+		}
+		return 1, reported("Could not stop services", sentence(firstLine(err)),
+			"Run coop down --delete-volumes again to continue the confirmed deletion.")
+	}
+	return reportDownPlanResult(exec, plan)
+}
+
+// downCompose runs the ordinary, manifest-free Compose stop. foundNoTargets only changes the
+// closing line for a --delete-volumes preview that found nothing to delete.
+func (a *app) downCompose(repo, file, rel string, foundNoTargets bool) (int, error) {
+	ui.Note("Stopping services from %s", rel)
+	ui.Note("")
+	out, errOut := &seenWriter{w: os.Stdout}, &seenWriter{w: os.Stderr}
+	err := box.DownServicesFile(a.rt, repo, file, false, out, errOut, box.ConfigExposureRoots(a.cfg)...)
 	if out.seen || errOut.seen {
 		ui.Note("")
 	}
@@ -381,24 +439,94 @@ func (a *app) cmdDown(args []string) (int, error) {
 	switch {
 	case err != nil && errors.As(err, &refused):
 		return 1, composeRefusal("Could not stop services from "+rel, rel, refused.Err, "coop down")
-	case err != nil && deleting:
-		return 1, reported("Could not finish stopping services and deleting their data",
-			sentence(firstLine(err)),
-			fmt.Sprintf("Check %s before retrying coop down --delete-volumes.", runtimeTitle(a.rt.Name)),
-			"Some services or volumes may already have been removed.")
 	case err != nil:
 		return 1, reported("Could not stop all services", sentence(firstLine(err)),
 			fmt.Sprintf("Check %s, then run coop down again.", runtimeTitle(a.rt.Name)),
 			"Some services may already be stopped.")
-	case deleting:
-		ui.OK("Services stopped; %s deleted", ui.Count(len(targets), "volume"))
-	case deleteVolumes:
+	case foundNoTargets:
 		ui.OK("Services stopped")
 	default:
 		ui.OK("Services stopped")
 		ui.Note("  Stored data was kept.")
 	}
 	return 0, nil
+}
+
+// noticePendingVolumeDeletion says which frozen list a resumed invocation continues, without
+// asking again: the persisted record IS the confirmation. Names already gone are omitted.
+func noticePendingVolumeDeletion(plan *box.DownPlan) {
+	pending := box.PendingDownVolumes(plan)
+	if len(pending) == 0 {
+		return
+	}
+	ui.Note("Resuming the volume deletion you already confirmed; the list is frozen and new volumes are not added:")
+	for _, v := range pending {
+		if v.Holds != "" {
+			ui.Note("  - %s — %s", ui.SafeInline(v.Name), ui.SafeInline(v.Holds))
+			continue
+		}
+		ui.Note("  - %s", ui.SafeInline(v.Name))
+	}
+	ui.Note("")
+}
+
+// reportDownPlanResult renders the one source of truth — the manifest's reconciled statuses:
+// everything deleted, anything still pending, anything refused for an identity change.
+func reportDownPlanResult(exec *box.DownPlanExecution, plan *box.DownPlan) (int, error) {
+	deleted, pending, refused := plan.Deleted(), plan.Pending(), plan.Refused()
+	switch {
+	case exec.DaemonUnreachable:
+		return 1, reported("Could not finish stopping services and deleting their data",
+			"Docker is unavailable.",
+			downOutcomeBlock(deleted, pending, refused,
+				"Start Docker, then run coop down --delete-volumes again to continue the confirmed deletion."))
+	case len(pending) > 0:
+		reason := ""
+		if exec.ComposeErr != nil {
+			reason = sentence(firstLine(exec.ComposeErr))
+		}
+		return 1, reported("Could not finish stopping services and deleting their data", reason,
+			downOutcomeBlock(deleted, pending, refused,
+				"Run coop down --delete-volumes again to continue the confirmed deletion."))
+	case len(refused) > 0:
+		return 1, reported("Some confirmed volumes were not deleted",
+			"A volume's identity changed after confirmation, so different data under the same name was kept.",
+			downOutcomeBlock(deleted, nil, refused,
+				"Review the current volumes, then run coop down --delete-volumes to delete them with a fresh confirmation."))
+	default:
+		ui.OK("Services stopped; %s deleted", ui.Count(len(plan.Volumes), "volume"))
+		return 0, nil
+	}
+}
+
+// downOutcomeBlock renders Deleted / Pending / Refused lists and the one follow-up action as a
+// single outcome section. Empty groups are omitted; each resource carries its kind so a container
+// and a same-named volume cannot be confused. The renderer indents only the block's first line,
+// so every continuation line carries its own absolute indentation.
+func downOutcomeBlock(deleted, pending, refused []box.DownPlanItem, action string) string {
+	var b strings.Builder
+	write := func(header string, items []box.DownPlanItem) {
+		if len(items) == 0 {
+			return
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n\n  ") // blank line, then the 2-space section indent
+		}
+		b.WriteString(header)
+		for _, item := range items {
+			fmt.Fprintf(&b, "\n    - %s (%s)", ui.SafeInline(item.Name), item.Kind)
+		}
+	}
+	write("Deleted:", deleted)
+	write("Pending — confirmed but still present:", pending)
+	write("Refused — identity changed since confirmation:", refused)
+	if action != "" {
+		if b.Len() > 0 {
+			b.WriteString("\n\n  ")
+		}
+		b.WriteString(action)
+	}
+	return b.String()
 }
 
 // confirmVolumeDeletion names every volume the deletion would destroy, then routes the decision

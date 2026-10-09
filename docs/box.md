@@ -355,6 +355,16 @@ with what it holds, and asks before removing any. The default answer is No, and 
 the question. Without a terminal it refuses rather than guessing. An `external: true` volume and a
 bind-mounted project file are never in scope.
 
+The moment you confirm, co:op freezes the exact daemon, containers, networks, and volumes (each
+volume by its object identity, not just its name) together with the validated Compose file, and
+saves that deletion record before removing anything. Each resource is marked deleted only after
+the runtime confirms it is gone. If Compose fails partway, the daemon is briefly unavailable, or
+the command is interrupted, run `coop down --delete-volumes` again: it resumes the frozen record
+without asking again and lists what was deleted and what is still pending. Editing the Compose
+file in between never widens a confirmed deletion; new volumes wait for the next confirmation. A
+volume that has been recreated under a confirmed name (different storage, or another daemon) is
+refused and kept rather than deleted.
+
 A change to the configured Compose file is reconciled on the next `coop up` or box launch: services
 removed from the file are stopped. `coop down` does the same. Every workspace uses its own hashed
 Compose project name, so repositories with the same basename stay isolated.

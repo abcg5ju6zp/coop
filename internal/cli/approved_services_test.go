@@ -274,35 +274,8 @@ func TestApprovedServiceStop(t *testing.T) {
 		assertApprovedOutput(t, "29j-stop-failed", out)
 	})
 
-	// The same failure while volumes were being deleted is a different fact, because some of them
-	// may be gone.
-	t.Run("29k-volume-deletion-failed", func(t *testing.T) {
-		repo := serviceProject(t)
-		shim := composeShim{services: []string{"db", "redis"}, volumes: projectVolumes(t, repo), downExit: 1}
-		a := &app{cfg: &config.Config{RepoOverride: repo}, rt: shim.build(t), rtSet: true}
-		typedAnswers(t, "y")
-		var code int
-		out := captureTerminal(t, func() { code, _ = a.cmdDown([]string{"--delete-volumes"}) })
-		if code != 1 {
-			t.Errorf("a failed deletion exited %d, want 1", code)
-		}
-		assertApprovedSession(t, "29k-volume-deletion-failed", normalizeProject(t, repo, out))
-	})
-
-	// The preview, then the shared gate, then the stop — in that order, so the answer is given
-	// against the list and nothing is removed before it.
-	t.Run("29d-delete-volumes-accepted", func(t *testing.T) {
-		repo := serviceProject(t)
-		shim := composeShim{services: []string{"db", "redis"}, volumes: projectVolumes(t, repo)}
-		a := &app{cfg: &config.Config{RepoOverride: repo}, rt: shim.build(t), rtSet: true}
-		typedAnswers(t, "y")
-		var code int
-		out := captureTerminal(t, func() { code, _ = a.cmdDown([]string{"--delete-volumes"}) })
-		if code != 0 {
-			t.Fatalf("an accepted deletion exited %d:\n%s", code, out)
-		}
-		assertApprovedSession(t, "29d-delete-volumes-accepted", normalizeProject(t, repo, out))
-	})
+	// The 29d/29g accepted-deletion and 29k partial-failure transcripts, plus the resume/refusal
+	// cases, run against the stateful shim in approved_down_test.go.
 
 	// A bare Enter is No: the gate's default is the safe one, and nothing is deleted or stopped.
 	t.Run("29e-delete-volumes-declined", func(t *testing.T) {
@@ -340,18 +313,6 @@ func TestApprovedServiceStop(t *testing.T) {
 			t.Errorf("an unconfirmed deletion exited %d, want 2", code)
 		}
 		assertApprovedOutput(t, "29f-delete-volumes-needs-a-terminal", normalizeProject(t, repo, out))
-	})
-
-	t.Run("29g-delete-volumes-yes", func(t *testing.T) {
-		repo := serviceProject(t)
-		shim := composeShim{services: []string{"db", "redis"}, volumes: projectVolumes(t, repo)}
-		a := &app{cfg: &config.Config{RepoOverride: repo}, rt: shim.build(t), rtSet: true}
-		var code int
-		out := captureTerminal(t, func() { code, _ = a.cmdDown([]string{"--delete-volumes", "--yes"}) })
-		if code != 0 {
-			t.Fatalf("a confirmed deletion exited %d:\n%s", code, out)
-		}
-		assertApprovedOutput(t, "29g-delete-volumes-yes", normalizeProject(t, repo, out))
 	})
 
 	// Nothing to delete is a fact the runtime supplied, not an assumption: it is said out loud,

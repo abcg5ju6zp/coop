@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -41,6 +42,21 @@ type DockerInfo struct {
 
 var errDockerCommandNotStarted = errors.New("Docker client command was not started")
 
+// ErrDaemonIdentityChanged means the daemon answering the bound endpoint is no longer the one
+// recorded for the operation. A destructive caller must reconcile each object's identity against
+// the new daemon instead of assuming the same names name the same storage.
+var ErrDaemonIdentityChanged = errors.New("Docker daemon identity changed")
+
+// ErrVolumeRemainsPending means a confirmed volume delete was submitted but the volume is still
+// observed on the bound daemon (usually still attached to a container). Its persisted deletion
+// todo stays pending; the failed request itself is never taken as evidence either way.
+var ErrVolumeRemainsPending = errors.New("Docker volume remains present; its deletion is pending")
+
+// ErrVolumeNotPlainLocal means a volume that was once ordinary local storage now inspects as a
+// plugin driver or option-backed definition. To a teardown manifest that is an identity change,
+// not the same object under the same name, so it refuses rather than deletes.
+var ErrVolumeNotPlainLocal = errors.New("Docker volume is not plain local storage")
+
 // BindDocker discovers only when endpoint is empty. Recovery supplies the
 // recorded endpoint and daemon ID; neither a missing context nor daemon failure
 // permits selecting another runtime. Remote/rootless engines need qualification.
@@ -53,6 +69,14 @@ func BindDocker(ctx context.Context, rt Runtime, endpoint, expectedID string) (*
 // authority, including on ordinary rootless or otherwise unqualified engines.
 func InspectDocker(ctx context.Context, rt Runtime) (*Docker, error) {
 	return bindDocker(ctx, rt, rt.composeEndpoint, rt.composeDaemon, false)
+}
+
+// RecoverDocker binds lifecycle control to a KNOWN endpoint without expecting the daemon it last
+// recorded: a persisted operation resuming after the daemon identity changed replays against the
+// same socket and reconciles each object itself. It grants no launch authority and never
+// rediscovers or follows the operator's current Docker context.
+func RecoverDocker(ctx context.Context, rt Runtime, endpoint string) (*Docker, error) {
+	return bindDocker(ctx, rt, endpoint, "", false)
 }
 
 func bindDocker(ctx context.Context, rt Runtime, endpoint, expectedID string, launchAllowed bool) (*Docker, error) {
@@ -116,7 +140,7 @@ func bindDocker(ctx context.Context, rt Runtime, endpoint, expectedID string, la
 		return nil, err
 	}
 	if expectedID != "" && info.ID != expectedID {
-		return nil, errors.New("Docker daemon identity changed; runtime custody remains pending")
+		return nil, fmt.Errorf("%w; runtime custody remains pending", ErrDaemonIdentityChanged)
 	}
 	if d.launchAllowed && (info.OSType != "linux" || !slices.Contains([]string{"aarch64", "arm64", "amd64", "x86_64"}, info.Architecture)) {
 		return nil, errors.New("Docker platform is not qualified for restricted networking")
@@ -173,7 +197,7 @@ func (d *Docker) InspectNamedVolume(ctx context.Context, name string) (NamedVolu
 	}
 	if definition.Driver != "local" || definition.Scope != "local" || len(definition.Options) != 0 ||
 		definition.CreatedAt == "" || !filepath.IsAbs(definition.Mountpoint) || filepath.Clean(definition.Mountpoint) != definition.Mountpoint {
-		return NamedVolumeIdentity{}, false, errors.New("Docker volume is not plain local storage; use a plain volume or an explicit repository bind")
+		return NamedVolumeIdentity{}, false, fmt.Errorf("%w; use a plain volume or an explicit repository bind", ErrVolumeNotPlainLocal)
 	}
 	if err := d.Verify(ctx); err != nil {
 		return NamedVolumeIdentity{}, false, err
@@ -195,6 +219,29 @@ func (d *Docker) CreatePlainNamedVolume(ctx context.Context, name string) (Named
 		return NamedVolumeIdentity{}, errors.Join(err, errors.New("created Docker volume could not be verified"))
 	}
 	return identity, nil
+}
+
+// RemoveConfirmedVolume deletes one already-approved named volume on the bound daemon and treats
+// only a positively observed absence as success. A non-zero `volume rm` (in use, a transient
+// daemon error) is reconciled by the follow-up inspection: still present ⇒ ErrVolumeRemainsPending,
+// the caller keeps it on its persisted todo; an inspection failure says the outcome is unknown.
+// A name reused by a different volume object is the caller's problem to catch BEFORE this call.
+func (d *Docker) RemoveConfirmedVolume(ctx context.Context, name string) error {
+	if !volumeName(name) {
+		return errors.New("invalid selected Docker volume name")
+	}
+	if err := d.Verify(ctx); err != nil {
+		return err
+	}
+	_, _ = d.output(ctx, 1024, "volume", "rm", name)
+	absent, err := d.volumeAbsent(ctx, name)
+	if err != nil {
+		return err
+	}
+	if !absent {
+		return ErrVolumeRemainsPending
+	}
+	return nil
 }
 
 func discoverDockerEndpoint(ctx context.Context, binary string, env []string) (string, error) {
@@ -429,7 +476,7 @@ func (d *Docker) Verify(ctx context.Context) error {
 		return err
 	}
 	if info.ID != d.info.ID {
-		return errors.New("Docker daemon identity changed; custody remains pending")
+		return fmt.Errorf("%w; custody remains pending", ErrDaemonIdentityChanged)
 	}
 	return nil
 }

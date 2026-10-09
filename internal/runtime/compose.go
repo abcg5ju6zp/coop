@@ -35,6 +35,18 @@ func (r Runtime) ComposeBinding() (endpoint, daemonID string) {
 	return r.composeEndpoint, r.composeDaemon
 }
 
+// ForCompose returns the runtime pinned to an already-frozen daemon target. It is how a persisted
+// service operation replays Compose against the exact endpoint and daemon recorded in its
+// manifest instead of the operator's current context.
+func (r Runtime) ForCompose(endpoint, daemonID string) Runtime {
+	if r.kind() != runtimeDocker || endpoint == "" || daemonID == "" {
+		return r
+	}
+	next := r
+	next.composeEndpoint, next.composeDaemon = endpoint, daemonID
+	return next
+}
+
 // ComposeImageID inspects an image on the daemon frozen for this service operation.
 // It never pulls; callers decide explicitly whether a terminal review may do so.
 func (r Runtime) ComposeImageID(ctx context.Context, image string) (string, error) {

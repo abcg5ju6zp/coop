@@ -8,10 +8,17 @@ Continue? [y/N] y
 Stopping services from .agent/compose.yml
 
 [Compose output]
+compose failed mid-teardown
 
 ✗ Could not finish stopping services and deleting their data
 
       Compose down exited with status 1.
 
-  Check Docker before retrying coop down --delete-volumes.
-  Some services or volumes may already have been removed.
+  Pending — confirmed but still present:
+    - db (container)
+    - redis (container)
+    - coop-atlas_default (network)
+    - coop-atlas_pgdata (volume)
+    - coop-atlas_redisdata (volume)
+
+  Run coop down --delete-volumes again to continue the confirmed deletion.
