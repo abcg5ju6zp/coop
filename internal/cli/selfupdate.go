@@ -15,7 +15,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -98,14 +97,16 @@ const (
 	selfUpdateCurrent                            // already the latest release
 	selfUpdateAhead                              // newer than the latest release; kept
 	selfUpdateInstalled                          // replaced with a newer release
+	selfUpdateBehind                             // a newer release exists; the caller stages it
 )
 
 // selfUpdateResult carries the versions involved so the caller can name both without asking
 // GitHub a second time.
 type selfUpdateResult struct {
-	Outcome selfUpdateOutcome
-	Current string // this binary's version, normalized (no leading v)
-	Latest  string // the latest release, normalized; "" when it was never resolved
+	Outcome   selfUpdateOutcome
+	Current   string // this binary's version, normalized (no leading v)
+	Latest    string // the latest release, normalized; "" when it was never resolved
+	LatestTag string // the latest release tag verbatim, e.g. "v2.7.3"; "" when never resolved
 }
 
 // installFailure is a hard binary-install failure, carrying the sentence a person reads and
@@ -120,52 +121,39 @@ type installFailure struct {
 func (e *installFailure) Error() string { return e.reason }
 func (e *installFailure) Unwrap() error { return e.err }
 
-// selfUpdate replaces the running coop binary with the latest release, if newer, and reports
-// what it did. A dev build, an already-current binary and a binary ahead of the release are all
-// no-ops. An inability to *check* for a release is a checkError (soft — the box rebuild still
-// runs); a write-permission or install failure is an installFailure (hard). The box rebuild that
-// follows in cmdUpdate runs in this (pre-update) process; the new binary takes effect next run.
-func selfUpdate() (selfUpdateResult, error) {
+// resolveSelfUpdate decides what the binary half of an update should do WITHOUT changing the
+// installed executable, so both the combined update and --self-only act on one decision: dev /
+// current / ahead are no-ops, behind names the executable the caller stages the candidate over,
+// a check failure is a checkError (soft), and an executable-location failure is an installFailure
+// (hard). Nothing here downloads an artifact.
+func resolveSelfUpdate() (selfUpdateResult, string, error) {
 	cur := resolveVersion()
-	if !releaseVersion(cur) {
-		return selfUpdateResult{Outcome: selfUpdateDev, Current: cur}, nil
-	}
 	result := selfUpdateResult{Current: normalizeVersion(cur)}
-
-	exe, err := executablePath()
+	if !releaseVersion(cur) {
+		result.Outcome = selfUpdateDev
+		return result, "", nil
+	}
+	exe, err := resolveUpdateExe()
 	if err != nil {
-		return result, &installFailure{reason: "Could not locate the running Coop binary: " + err.Error() + ".", unchanged: true, err: err}
+		return result, "", err
 	}
-	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = resolved
-	}
-
 	latest, err := latestReleaseTag()
 	if err != nil {
-		return result, checkError{err}
+		return result, "", checkError{err}
 	}
 	result.Latest = normalizeVersion(latest)
+	result.LatestTag = latest
 	switch compareReleaseVersions(cur, latest) {
 	case releaseInvalid:
-		return result, checkError{errors.New("GitHub did not return a valid release version")}
+		return result, "", checkError{errors.New("GitHub did not return a valid release version")}
 	case releaseEqual:
 		result.Outcome = selfUpdateCurrent
-		return result, nil
 	case releaseAhead:
 		result.Outcome = selfUpdateAhead
-		return result, nil
 	case releaseBehind:
-		// Continue to the verified install below.
+		result.Outcome = selfUpdateBehind
 	}
-
-	if err := dirWritable(filepath.Dir(exe)); err != nil {
-		return result, &installFailure{reason: exe + " could not be replaced: " + osCause(err) + ".", unchanged: true, err: err}
-	}
-	if err := installRelease(exe, latest); err != nil {
-		return result, err
-	}
-	result.Outcome = selfUpdateInstalled
-	return result, nil
+	return result, exe, nil
 }
 
 // dirWritable reports whether dir accepts new files (so the atomic install can stage a
@@ -180,10 +168,12 @@ func dirWritable(dir string) error {
 	return os.Remove(name)
 }
 
-// installRelease downloads the exact GoReleaser archive and checksums for tag,
-// verifies the archive locally, then atomically replaces exe. Every failure before the rename
-// leaves the installed binary untouched and says so; only the rename itself can change it.
-func installRelease(exe, tag string) error {
+// fetchVerifiedReleaseBinary downloads the checksum file and the GoReleaser archive for tag,
+// verifies the archive against the published checksum, and extracts the Coop binary from it.
+// Nothing here touches the installed executable: every failure is an installFailure that left
+// it unchanged. The bytes are what a generation update stages as its candidate — verification
+// happens here, before the candidate can be executed or activated.
+func fetchVerifiedReleaseBinary(tag string) ([]byte, error) {
 	version := normalizeVersion(tag)
 	asset := fmt.Sprintf("coop_%s_%s_%s.tar.gz", version, runtime.GOOS, runtime.GOARCH)
 	fail := func(reason string, err error) error {
@@ -191,20 +181,74 @@ func installRelease(exe, tag string) error {
 	}
 	checksums, err := fetchReleaseFile(tag, "checksums.txt", maxReleaseChecksumsBytes)
 	if err != nil {
-		return fail("Could not download the release checksums: "+err.Error()+".", err)
+		return nil, fail("Could not download the release checksums: "+err.Error()+".", err)
 	}
 	archive, err := fetchReleaseFile(tag, asset, maxReleaseArchiveBytes)
 	if err != nil {
-		return fail("Could not download "+asset+": "+err.Error()+".", err)
+		return nil, fail("Could not download "+asset+": "+err.Error()+".", err)
 	}
 	if err := verifyReleaseChecksum(asset, archive, checksums); err != nil {
-		return fail(sentence(err.Error()), err)
+		return nil, fail(sentence(err.Error()), err)
 	}
 	binary, err := releaseBinary(archive)
 	if err != nil {
-		return fail(sentence(err.Error()), err)
+		return nil, fail(sentence(err.Error()), err)
 	}
-	return replaceExecutable(exe, binary)
+	return binary, nil
+}
+
+// stageReleaseBinary downloads and verifies tag and writes its binary to stagedPath (0755,
+// fsynced) WITHOUT touching the installed executable. It returns the hex sha256 of the staged
+// bytes, so an interrupted update can later prove the staged candidate is still this release
+// instead of trusting or re-downloading it. Every failure leaves both the stage and the installed
+// binary untouched.
+func stageReleaseBinary(stagedPath, tag string) (string, error) {
+	binary, err := fetchVerifiedReleaseBinary(tag)
+	if err != nil {
+		return "", err
+	}
+	if err := writeStagedBinary(stagedPath, binary); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(binary)), nil
+}
+
+// commitStagedBinary activates a staged candidate by atomically renaming it over exe — the single
+// point at which the active binary changes. The rename is the commit: its failure leaves the
+// installed binary provably unchanged, and nothing after a successful rename can undo it.
+func commitStagedBinary(stagedPath, exe string) error {
+	if err := os.Rename(stagedPath, exe); err != nil {
+		return &installFailure{reason: "Could not replace " + exe + ": " + osCause(err) + ".", unchanged: true, err: err}
+	}
+	return nil
+}
+
+// writeStagedBinary writes binary to path with the executable mode and an fsync, so a crash or
+// power loss leaves either no stage or a complete runnable one — never a half-written candidate a
+// later resume could execute.
+func writeStagedBinary(path string, binary []byte) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o755)
+	if err != nil {
+		return &installFailure{reason: "Could not prepare the new Coop binary: " + osCause(err) + ".", unchanged: true, err: err}
+	}
+	name := f.Name()
+	_, werr := f.Write(binary)
+	if cerr := f.Chmod(0o755); werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = f.Sync()
+	}
+	cerr := f.Close()
+	if werr != nil || cerr != nil {
+		_ = os.Remove(name)
+		err := werr
+		if err == nil {
+			err = cerr
+		}
+		return &installFailure{reason: "Could not prepare the new Coop binary: " + osCause(err) + ".", unchanged: true, err: err}
+	}
+	return nil
 }
 
 func fetchReleaseFile(tag, name string, limit int64) ([]byte, error) {
@@ -286,44 +330,4 @@ func releaseBinary(archive []byte) ([]byte, error) {
 		return nil, errors.New("the release archive contains no Coop binary")
 	}
 	return binary, nil
-}
-
-func replaceExecutable(exe string, binary []byte) (retErr error) {
-	// Everything up to the rename is staging: it can fail freely, and the binary on disk is the
-	// one that was there before. Cleanup AFTER a successful rename cannot take that back, so its
-	// failure is reported without the "unchanged" claim.
-	prepare := func(err error) error {
-		return &installFailure{reason: "Could not prepare the new Coop binary: " + osCause(err) + ".", unchanged: true, err: err}
-	}
-	f, err := os.CreateTemp(filepath.Dir(exe), ".coop-new-*")
-	if err != nil {
-		return prepare(err)
-	}
-	name := f.Name()
-	installed := false
-	defer func() {
-		if err := os.Remove(name); err != nil && !os.IsNotExist(err) && retErr == nil {
-			retErr = &installFailure{reason: "Could not clean up the staged Coop binary: " + osCause(err) + ".", unchanged: !installed, err: err}
-		}
-	}()
-	if _, err := f.Write(binary); err != nil {
-		_ = f.Close()
-		return prepare(err)
-	}
-	if err := f.Chmod(0o755); err != nil {
-		_ = f.Close()
-		return prepare(err)
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return prepare(err)
-	}
-	if err := f.Close(); err != nil {
-		return prepare(err)
-	}
-	if err := os.Rename(name, exe); err != nil {
-		return &installFailure{reason: "Could not replace " + exe + ": " + osCause(err) + ".", unchanged: true, err: err}
-	}
-	installed = true
-	return nil
 }

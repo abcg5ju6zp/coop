@@ -1857,7 +1857,11 @@ Usage:
 Updates the Coop binary when a newer release is available, then rebuilds
 the box on newer base-image components. The agent CLIs and editor adapters
 stay at the versions this Coop release qualifies.
-Downloaded releases are checked before replacing the binary.
+The new release is downloaded and checksum-verified as a candidate; the
+candidate builds its own box image, and only then is the active binary
+replaced and are supervised sessions restarted — so Coop and the image
+always switch as one verified combination. An interrupted update resumes
+or keeps the current combination on the next run.
 The rebuild prepares the ordinary image; filtered project images require
 coop build --egress filtered. Project builds use ordinary networking.
 
@@ -1870,11 +1874,14 @@ Choose at most one option. --check does not need a container runtime.
 Building the box requires a running container runtime.
 
 Development builds and binaries newer than the latest release are kept.
-A binary that cannot be replaced is an error; update it with the tool
-that installed it. The box rebuild can still finish independently.
+A failed download or image build discards the candidate and leaves the
+installed Coop and image unchanged; a binary that cannot be replaced is
+an error — update it with the tool that installed it. The box rebuild can
+still finish independently.
 
-New runs use the rebuilt image. Supervised editor sessions restart and
-reconnect. Other running boxes use the old image until their next start.
+New runs use the new image. Supervised editor sessions restart and
+reconnect; sessions that could not restart are retried on the next run.
+Other running boxes use the old image until their next start.
 
 Coop checks for new releases once a day during terminal use.
 Set COOP_NO_UPDATE_CHECK=1 to turn off those notices.

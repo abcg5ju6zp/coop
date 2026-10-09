@@ -552,10 +552,15 @@ coop update --self-only  # just upgrade the coop binary
 coop update --box-only   # just rebuild the image (the old behavior)
 ```
 
-`coop update` first replaces the `coop` binary when GitHub has a newer release. It downloads that
-release's versioned archive and checksum, verifies the archive locally, then swaps it in
-atomically, so replacing the running binary is safe. The binary swap takes effect on your next
-`coop` run.
+`coop update` switches Coop and the box as one verified generation when GitHub has a newer release.
+It downloads that release's versioned archive and checksum and verifies the archive locally, but
+the new binary is staged as a *candidate* rather than swapped in immediately: the staged Coop then
+builds its own box image (so the image comes from the new release's box definition), and only once
+that image is verified does Coop atomically replace the active binary and restart supervised editor
+sessions onto it. A failed download or image build discards the candidate and leaves the installed
+Coop and image unchanged. If the process dies mid-update, the next `coop update` (or ordinary
+startup) resumes from the recorded stage or keeps the current combination. Sessions that could not
+be restarted at the switch are retried by id on the next run.
 
 When the binary is not replaced:
 

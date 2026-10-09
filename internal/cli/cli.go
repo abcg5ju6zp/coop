@@ -99,6 +99,10 @@ func (a *app) ensureRuntimeContext(ctx context.Context) error {
 		}
 	}
 	a.rt, a.rtSet = rt, true
+	// Finish a generation switch's recorded session restarts once per process, silently and
+	// best-effort: it acts only when this running binary is the recorded generation and only on the
+	// exact container ids recorded at the switch. Failures stay persisted for the next run.
+	a.resumePendingRecycle()
 	return nil
 }
 
@@ -111,6 +115,12 @@ func Main(argv []string) int {
 	}
 	box.ResolveBaseImage(cfg)
 	if !detachedWorkerReexec(argv) {
+		// Reconcile an interrupted generation update before any command reads state. The candidate
+		// child (`coop internal …`) is itself the staged generation acting ON that state, so it
+		// must skip healing it.
+		if len(argv) == 0 || argv[0] != "internal" {
+			healUpdateGeneration(cfg)
+		}
 		// Once a day, check for a newer coop in the background and mention it as the command's
 		// parting line (deferred, so it runs on every return path). See startUpdateCheck.
 		defer startUpdateCheck(cfg, argv)()
@@ -346,6 +356,8 @@ func (a *app) dispatch(argv []string) (int, error) {
 		return a.cmdBuild(rest)
 	case "update":
 		return a.cmdUpdate(rest)
+	case "internal": // hidden: the staged candidate drives its own image build during a generation update
+		return a.cmdInternal(rest)
 	case "sign": // host-local: re-sign the unpushed range with your host key (no box)
 		return a.cmdSign(rest)
 	case "prompt": // pure-local: a one-line status for a shell prompt / tmux (no git per fork, no docker)

@@ -136,10 +136,11 @@ func updateNotice(cur, latest string) string {
 
 // startUpdateCheck begins the daily background check when it's due and returns the
 // finisher Main defers: it prints the one notice line after the command's own output.
-// Silent no-op for: `coop update` (you're updating) and `coop acp` (stdio protocol),
-// opted-out configs, dev/source builds, non-TTY runs, and days already checked.
+// Silent no-op for: `coop update` (you're updating), `coop acp` (stdio protocol), and
+// `coop internal` (a staged candidate building its image mid-update — its parting line would
+// corrupt build output), opted-out configs, dev builds, non-TTY runs, and days already checked.
 func startUpdateCheck(cfg *config.Config, argv []string) func() {
-	if len(argv) > 0 && (argv[0] == "update" || argv[0] == "acp") {
+	if len(argv) > 0 && (argv[0] == "update" || argv[0] == "acp" || argv[0] == "internal") {
 		return func() {}
 	}
 	cur := resolveVersion()

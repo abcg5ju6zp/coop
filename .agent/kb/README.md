@@ -63,6 +63,7 @@ resolving). What it can't tell you is whether a card is still TRUE; only reading
 - [box-egress-poc](box-egress-poc.md) — transparent HTTPS experiment guards hidden Docker DNS ports and shared control sockets; not a production mode
 - [in-box-task-channel](in-box-task-channel.md) — the loop box changes task state through the coop-owned `coop-tasks` MCP server over a helper-container unix socket (never a host-created one, never HTTP), refusing only a task another live process holds
 - [release-qualification](release-qualification.md) — tagged releases reuse exact-commit CI, validate finalized notes and preserve tag identity
+- [update-generation](update-generation.md) — `coop update` stages+verifies a candidate, builds the image from the candidate binary, then atomically renames and restarts recorded sessions; persisted resume/rollback at every stage
 - [box-time-is-utc](box-time-is-utc.md) — boxes run UTC; the host TZ is forwarded so rate-limit reset prose parses back host-local
 - [box-base-image-tags](box-base-image-tags.md) — the shared base is `coop-box:<definition>` so two Coop versions keep their own; no :latest alias, an upgrade is built on launch, project images stay shared
 - [box-home-nested-mounts](box-home-nested-mounts.md) — avoid bind targets that make Docker create missing application-owned home parents as root

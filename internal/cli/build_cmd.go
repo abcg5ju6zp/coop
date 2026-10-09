@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -163,6 +164,13 @@ func (a *app) reportRecycle(repo, built, retry string) (int, error) {
 			fmt.Sprintf("Check %s, then run %s again.", runtimeTitle(a.rt.Name), retry),
 			"New runs can use the "+strings.ToLower(strings.TrimPrefix(built, "Box image "))+" image.")
 	}
+	// The label-wide restart also satisfied any restart an earlier generation switch recorded, so
+	// its pending objects no longer need a recorded retry. A downgraded binary keeps its record:
+	// this label removal was for the image the RUNNING binary builds, not the recorded generation.
+	if st := loadGenerationState(a.cfg); st.pendingMatchesRunning() {
+		st.Pending = nil
+		_ = st.save(a.cfg)
+	}
 	if supervised > 0 {
 		ui.Note("  %s will reconnect with the new image.", ui.Count(supervised, "supervised editor session"))
 	}
@@ -205,13 +213,24 @@ func (a *app) recycleBoxes(repo string) (supervised, others int, err error) {
 	return n, len(running) - len(live), nil
 }
 
-// cmdUpdate self-updates the coop binary to the latest release, then force-rebuilds
-// the box image (--pull --no-cache) on the newest OS packages and Node — the agent
-// clients stay the set this Coop qualifies — then reports which clients it carries.
-// --self-only does just the binary; --box-only does just the image (the old behavior).
+// cmdUpdate performs one recoverable generation change. The newer binary is downloaded and
+// checksum-verified into a CANDIDATE stage, the candidate binary itself builds and verifies the
+// image from ITS OWN embedded box definition, and only once both exist does the active executable
+// get replaced (one atomic rename) and the supervised sessions restart onto the new image.
 //
-// The binary is replaced BEFORE the rebuild, and the rebuild runs in THIS, pre-update process —
-// so the image is built by the old binary's box definition. Nothing here may say otherwise.
+// Failure semantics, by stage:
+//   - download/checksum/stage failure: the candidate is discarded; the old binary and image stay
+//     the active combination. The independent image refresh still runs, as before.
+//   - candidate image build/verification failure: the candidate is discarded; the old combination
+//     is untouched (the rename never happened).
+//   - session restart failure AFTER the rename: the new binary+image stay active; the exact boxes
+//     that did not restart are recorded and retried (by id) on the next startup or update.
+//
+// A process killed between stages is continued or safely superseded on the next update via the
+// persisted generation state (update_generation.json). --self-only does only the binary stage and
+// rename (no image, no restarts), --box-only does only the active binary's image (no candidate,
+// no rename); neither breaks the other half's state. Re-running the same version is a no-op for
+// the binary half, while still refreshing the image as `coop update` always has.
 func (a *app) cmdUpdate(args []string) (int, error) {
 	selfOnly, boxOnly, check, err := parseUpdateFlags(args)
 	if err != nil {
@@ -220,47 +239,236 @@ func (a *app) cmdUpdate(args []string) (int, error) {
 	if check {
 		return a.cmdUpdateCheck()
 	}
-
-	// Self-update the binary first. A failed *check* (offline/rate limit) is soft and
-	// must not block the box rebuild; a write or install failure is loud and exits
-	// non-zero, but the box still rebuilds (it's independent) so the run isn't wasted.
-	selfFailed := false
-	if !boxOnly {
-		result, err := selfUpdate()
-		var soft checkError
-		switch {
-		case err == nil:
-			reportSelfUpdate(result)
-		case selfOnly:
-			return 1, selfUpdateFailure(err, "coop update --self-only")
-		case errors.As(err, &soft):
-			warnBlock("Could not check for a newer Coop release", sentence(firstLine(err)),
-				"Continuing with the box update.")
-			ui.Note("")
-		default:
-			failBlock("Could not update the Coop binary", sentence(firstLine(err)),
-				"Update Coop with the tool that installed it.",
-				"Continuing with the box update.")
-			ui.Note("")
-			selfFailed = true
-		}
-		if selfOnly {
-			return 0, nil
-		}
+	if selfOnly {
+		return a.cmdUpdateSelf()
 	}
 
-	// The box rebuild needs the runtime; --self-only returned above, so detect only here (not eagerly
+	// Binary half. A dev/current/ahead build and a failed *check* (offline/rate limit) build the
+	// ACTIVE image afterwards, exactly as before. Only a newer release takes the candidate path.
+	// --box-only never stages or switches a binary and never touches the candidate record.
+	st := loadGenerationState(a.cfg)
+	var candidate *candidateState
+	selfFailed := false
+	if !boxOnly {
+		candidate, selfFailed = a.stageUpdateCandidate(st)
+	}
+
+	// The box halves need the runtime; --self-only returned above, so detect only here (not eagerly
 	// in dispatch), keeping `coop update --self-only` usable on a box with no container runtime.
 	repo, _, err := loadProject(a.cfg.RepoOverride)
 	if err != nil {
 		return -1, err
 	}
 	if err := a.ensureRuntime(); err != nil {
-		return 1, updateBoxFailure(err, a.rt.Name, selfFailed)
+		return 1, updateBoxFailure(err, a.rt.Name, selfFailed, a.updateBoxRetry(candidate != nil))
 	}
+
+	if candidate != nil {
+		return a.commitCandidateGeneration(st, candidate, repo)
+	}
+	return a.refreshActiveBox(repo, selfFailed)
+}
+
+// cmdUpdateSelf is `coop update --self-only`: verify and stage the newer binary, rename it active,
+// and stop. It neither builds images nor restarts sessions, and it never removes a pending recycle
+// another generation recorded.
+func (a *app) cmdUpdateSelf() (int, error) {
+	result, exe, err := resolveSelfUpdate()
+	if err != nil {
+		return 1, selfUpdateFailure(err, "coop update --self-only")
+	}
+	switch result.Outcome {
+	case selfUpdateDev, selfUpdateCurrent, selfUpdateAhead:
+		reportSelfUpdate(result)
+		return 0, nil
+	case selfUpdateBehind:
+		// Continue to the verified stage + rename below.
+	}
+	if err := dirWritable(filepath.Dir(exe)); err != nil {
+		err = &installFailure{reason: exe + " could not be replaced: " + osCause(err) + ".", unchanged: true, err: err}
+		return 1, selfUpdateFailure(err, "coop update --self-only")
+	}
+	st := loadGenerationState(a.cfg)
+	c, err := st.stageOrResumeCandidate(a.cfg, exe, result.LatestTag)
+	if err != nil {
+		return 1, selfUpdateFailure(err, "coop update --self-only")
+	}
+	if err := commitStagedBinary(c.Staged, exe); err != nil {
+		return 1, selfUpdateFailure(err, "coop update --self-only")
+	}
+	// Clear only this candidate record; a pending restart an earlier generation recorded stays for
+	// the runtime-bearing commands to finish. A crash in this window looks like a completed switch
+	// and startup healing clears the leftover record.
+	st.Candidate = nil
+	_ = st.save(a.cfg)
+	result.Outcome = selfUpdateInstalled
+	reportSelfUpdate(result)
+	return 0, nil
+}
+
+// stageUpdateCandidate runs the binary half of a combined update and reports its outcome. A
+// candidate for a newer release is staged and returned; dev/current/ahead and a soft check failure
+// return no candidate (the caller refreshes the active image). A hard download/install failure is
+// loud but does not stop the independent image refresh: selfFailed is set for the closing warning.
+func (a *app) stageUpdateCandidate(st *generationState) (candidate *candidateState, selfFailed bool) {
+	result, exe, err := resolveSelfUpdate()
+	if err == nil {
+		switch result.Outcome {
+		case selfUpdateDev, selfUpdateCurrent, selfUpdateAhead:
+			reportSelfUpdate(result)
+			return nil, false
+		case selfUpdateBehind:
+			// Continue to the verified stage below.
+		}
+	} else {
+		var soft checkError
+		if errors.As(err, &soft) {
+			warnBlock("Could not check for a newer Coop release", sentence(firstLine(err)),
+				"Continuing with the box update.")
+			ui.Note("")
+			return nil, false
+		}
+		a.reportSelfHardFailure(err)
+		return nil, true
+	}
+	if err := dirWritable(filepath.Dir(exe)); err != nil {
+		a.reportSelfHardFailure(&installFailure{reason: exe + " could not be replaced: " + osCause(err) + ".", unchanged: true, err: err})
+		return nil, true
+	}
+	c, err := st.stageOrResumeCandidate(a.cfg, exe, result.LatestTag)
+	if err != nil {
+		a.reportSelfHardFailure(err)
+		return nil, true
+	}
+	return c, false
+}
+
+// reportSelfHardFailure renders the loud binary failure while promising the box refresh continues.
+func (a *app) reportSelfHardFailure(err error) {
+	failBlock("Could not update the Coop binary", sentence(firstLine(err)),
+		"Update Coop with the tool that installed it.",
+		"Continuing with the box update.")
+	ui.Note("")
+}
+
+// commitCandidateGeneration builds the candidate's image with the candidate binary, verifies it,
+// then switches the active executable and restarts the recorded supervised sessions. Nothing here
+// reports success before the step it names has happened.
+func (a *app) commitCandidateGeneration(st *generationState, c *candidateState, repo string) (int, error) {
+	// The candidate resolves and builds its OWN image (its embedded definition and client lock).
+	plan, err := runCandidatePlan(a.cfg, c.Staged)
+	if err != nil {
+		// Runtime was readied by the caller; this is a context/plan failure, not a missing daemon.
+		return 1, reported("Could not update the box image", sentence(firstLine(err)),
+			"Fix the path or permissions, then run coop update again.",
+			"The installed Coop and box image were not changed.")
+	}
+	if plan.Version != "" && plan.Version != c.Version {
+		return 1, reported("Could not update the box image",
+			fmt.Sprintf("The staged Coop reported version %s, expected v%s.", plan.Version, c.Version),
+			"Run coop update again to download a fresh candidate.",
+			"The installed Coop and box image were not changed.")
+	}
+	ui.Note("Updating the Coop box")
+	ui.Note("  Fetching newer base-image components. Agent clients stay at the versions this Coop qualifies.")
+	ui.Note("  Image:      %s", plan.Image)
+	ui.Note("")
+
+	// Resume skips a build whose image already exists (the candidate stamped it before the crash).
+	if c.Phase != phaseImageReady || c.Image != plan.Image || !box.ImageExists(a.rt, plan.Image) {
+		if err := runCandidateBuild(a.cfg, c.Staged, plan.Image); err != nil {
+			// Image build failure: the binary rename never happened. Drop the candidate so the old
+			// binary+image remain the one active, complete combination.
+			st.discardCandidate(a.cfg)
+			return 1, reported("Could not update the box image", sentence(firstLine(err)),
+				"Fix the build error, then run coop update again.",
+				"The installed Coop and box image were not changed.")
+		}
+		if !box.ImageExists(a.rt, plan.Image) {
+			st.discardCandidate(a.cfg)
+			return 1, reported("Could not update the box image", "The staged Coop reported a build, but the image is not present in the runtime.",
+				"Check "+runtimeTitle(a.rt.Name)+", then run coop update again.",
+				"The installed Coop and box image were not changed.")
+		}
+		if err := st.markCandidateImageReady(a.cfg, c, repo, plan); err != nil {
+			return 1, reported("Could not prepare the Coop update", sentence(firstLine(err)),
+				"Run coop update again.",
+				"The installed Coop and box image were not changed.")
+		}
+	}
+
+	// Snapshot the exact supervised boxes the switch must restart BEFORE renaming, so a failure in
+	// the rename window neither changes the binary nor owes a restart. Other (unsupervised) running
+	// boxes are counted, never killed — they take the new image on their next start.
+	a.sweepOrphanBoxes(repo)
+	supervised, others, err := a.runningSupervisedBoxes()
+	if err != nil {
+		return 1, reported("Could not prepare the Coop update", sentence(firstLine(err)),
+			"Check "+runtimeTitle(a.rt.Name)+", then run coop update again.",
+			"The installed Coop and box image were not changed.")
+	}
+	st.armPending(c, supervised)
+	if err := st.save(a.cfg); err != nil {
+		st.Pending = nil
+		return 1, reported("Could not prepare the Coop update", sentence(firstLine(err)),
+			"Run coop update again.",
+			"The installed Coop and box image were not changed.")
+	}
+	if err := commitStagedBinary(c.Staged, c.Exe); err != nil {
+		st.Pending = nil // the rename did not land: no restart is owed
+		_ = st.save(a.cfg)
+		return 1, selfUpdateFailure(err, "coop update")
+	}
+	st.Candidate = nil
+	if err := st.save(a.cfg); err != nil {
+		// The rename is committed regardless; the record still lists the candidate, which startup
+		// healing reconciles (the running version now matches) while keeping the pending restart.
+		return 1, reported("Could not record the completed Coop update", sentence(firstLine(err)),
+			"The new Coop is installed; restarting supervised sessions will be retried on the next run.")
+	}
+
+	ui.OK("Box image updated")
+	ui.OK("Coop updated to v%s", c.Version)
+	ui.Note("")
+	code := a.reportGenerationRecycle(st, len(others))
+	ui.Note("")
+	reportInstalledToolsPlan(plan)
+	return code, nil
+}
+
+// reportGenerationRecycle restarts the recorded supervised boxes by exact id after a generation
+// switch. Surviving ids stay recorded with the cause; only removed boxes are promised a reconnect.
+func (a *app) reportGenerationRecycle(st *generationState, others int) int {
+	ctx, cancel := context.WithTimeout(context.Background(), recycleBoxesTimeout)
+	defer cancel()
+	removed, err := a.recyclePendingIDs(ctx, st)
+	if err != nil {
+		ui.Note("")
+		actions := []string{"Check " + runtimeTitle(a.rt.Name) + ", then run coop update again to finish the restart."}
+		if removed > 0 {
+			ui.Note("  %s will reconnect with the new image.", ui.Count(removed, "supervised editor session"))
+		}
+		_ = reported("Could not restart all supervised editor sessions", sentence(firstLine(err)),
+			actions...)
+		// The new combination stays active; the surviving boxes are the recorded pending objects.
+		return 1
+	}
+	if removed > 0 {
+		ui.Note("  %s will reconnect with the new image.", ui.Count(removed, "supervised editor session"))
+	}
+	if others > 0 {
+		ui.Note("  %s will use the new image on its next start.", ui.Count(others, "other running box", "other running boxes"))
+	}
+	return 0
+}
+
+// refreshActiveBox is the no-candidate path: the running binary fresh-rebuilds its own image (the
+// behavior for dev/current/ahead builds, a soft check failure, and --box-only) and restarts the
+// supervised boxes.
+func (a *app) refreshActiveBox(repo string, selfFailed bool) (int, error) {
 	plan, err := box.PlanBuild(a.rt, a.cfg, repo, true)
 	if err != nil {
-		return 1, updateBoxFailure(err, a.rt.Name, selfFailed)
+		return 1, updateBoxFailure(err, a.rt.Name, selfFailed, "coop update --box-only")
 	}
 	ui.Note("Updating the Coop box")
 	ui.Note("  Fetching newer base-image components. Agent clients stay at the versions this Coop qualifies.")
@@ -268,7 +476,7 @@ func (a *app) cmdUpdate(args []string) (int, error) {
 	ui.Note("")
 	if err := box.BuildPlanned(a.rt, a.cfg, repo, plan, true, resolveVersion(), os.Stdin, os.Stdout); err != nil {
 		ui.Note("")
-		return 1, updateBoxFailure(err, a.rt.Name, selfFailed)
+		return 1, updateBoxFailure(err, a.rt.Name, selfFailed, "coop update --box-only")
 	}
 	ui.Note("")
 	ui.OK("Box image updated")
@@ -283,6 +491,51 @@ func (a *app) cmdUpdate(args []string) (int, error) {
 		return 1, nil // box updated, binary didn't — signal the partial failure
 	}
 	return 0, nil
+}
+
+// resolveUpdateExe is the installed executable path, symlinks resolved (the rename target).
+func resolveUpdateExe() (string, error) {
+	exe, err := executablePath()
+	if err != nil {
+		return "", &installFailure{reason: "Could not locate the running Coop binary: " + err.Error() + ".", unchanged: true, err: err}
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return exe, nil
+}
+
+// runningSupervisedBoxes lists every running box and, within it, the supervised ones — the exact
+// restart set recorded at a generation switch. The labels are global, not per project.
+func (a *app) runningSupervisedBoxes() (supervised, others []string, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), recycleBoxesTimeout)
+	defer cancel()
+	runtimeName := runtimeTitle(a.rt.Name)
+	running, err := a.rt.RunningContainerIDsByLabel(ctx, box.LabelKey, box.LabelBox)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s did not respond while listing running boxes: %w", runtimeName, err)
+	}
+	live, err := a.rt.RunningContainerIDsByLabel(ctx, box.LabelSupervised, box.LabelOn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%s did not respond while listing supervised boxes: %w", runtimeName, err)
+	}
+	return live, subtractContainerIDs(running, live), nil
+}
+
+// subtractContainerIDs returns the ids in all not present in keep, de-duplicated (runtime answers
+// may overlap when one container matches several label queries).
+func subtractContainerIDs(all, keep []string) []string {
+	seen := make(map[string]struct{}, len(keep))
+	for _, id := range keep {
+		seen[id] = struct{}{}
+	}
+	var out []string
+	for _, id := range all {
+		if _, ok := seen[id]; !ok {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 // displayVersion is how a version is written for a person: a git-describe build is a version and
@@ -330,31 +583,54 @@ func selfUpdateFailure(err error, retry string) error {
 }
 
 // updateBoxFailure keeps a successful binary installation visible: a failed rebuild does not undo
-// the new binary, and saying nothing about it would read as a whole update rolled back.
-func updateBoxFailure(err error, runtimeName string, selfFailed bool) error {
-	actions := []string{"Fix the build error, then run coop update --box-only."}
+// the new binary, and saying nothing about it would read as a whole update rolled back. retry names
+// the command that makes progress: the active-image path retries with --box-only, while a failed
+// generation update (candidate discarded) must run the whole `coop update` again.
+func updateBoxFailure(err error, runtimeName string, selfFailed bool, retry string) error {
+	actions := []string{"Fix the build error, then run " + retry + "."}
 	reason := sentence(firstLine(err))
 	var stage *box.StageError
 	switch {
 	case errors.As(err, &stage):
-		actions = []string{"Fix the path or permissions, then run coop update --box-only."}
+		actions = []string{"Fix the path or permissions, then run " + retry + "."}
 	case runtimeUnavailable(err):
 		reason = fmt.Sprintf("%s is unavailable.", runtimeTitle(runtimeName))
-		actions = []string{fmt.Sprintf("Start %s, then run coop update --box-only.", runtimeTitle(runtimeName))}
+		actions = []string{fmt.Sprintf("Start %s, then run %s.", runtimeTitle(runtimeName), retry)}
 	}
-	if !selfFailed && releaseVersion(resolveVersion()) {
+	// Only the active-image path can truthfully say the new binary is already installed: when a
+	// generation update fails before the rename, the installed binary is the old one.
+	if !selfFailed && retry == "coop update --box-only" && releaseVersion(resolveVersion()) {
 		actions = append(actions, fmt.Sprintf("Coop v%s is already installed.", normalizeVersion(resolveVersion())))
 	}
 	return reported("Could not update the box image", reason, actions...)
+}
+
+// updateBoxRetry names the retry command for the box half: a staged candidate needs the whole
+// generation update re-run; without one the image-only retry suffices.
+func (a *app) updateBoxRetry(hasCandidate bool) string {
+	if hasCandidate {
+		return "coop update"
+	}
+	return "coop update --box-only"
 }
 
 // reportInstalledTools names the agent clients the rebuilt image carries: Coop's qualified set,
 // which the build installed from the lock this binary embeds (it fails rather than install
 // anything else) — unless the project's Dockerfile builds on another base and brings its own.
 func reportInstalledTools(plan box.BuildPlan) {
+	reportInstalledToolsFields(plan.Project, plan.CarriesQualifiedClients(), plan.Dockerfile)
+}
+
+// reportInstalledToolsPlan is the same report from the candidate child's plan answer: the
+// candidate built the image, so the facts arrive as data rather than as a box.BuildPlan.
+func reportInstalledToolsPlan(plan internalPlanResult) {
+	reportInstalledToolsFields(plan.Project, plan.CarriesQualifiedClients, plan.Dockerfile)
+}
+
+func reportInstalledToolsFields(project, carriesQualified bool, dockerfile string) {
 	ui.Note("Agent clients")
-	if !plan.CarriesQualifiedClients() {
-		ui.Note("  This project's %s does not build on Coop's box, so it brings its own.", plan.Dockerfile)
+	if project && !carriesQualified {
+		ui.Note("  This project's %s does not build on Coop's box, so it brings its own.", dockerfile)
 		return
 	}
 	for _, client := range agents.QualifiedClients() {

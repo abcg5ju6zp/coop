@@ -83,7 +83,7 @@ func TestLatestReleaseTag(t *testing.T) {
 	})
 }
 
-func TestInstallRelease(t *testing.T) {
+func TestStageAndCommitRelease(t *testing.T) {
 	archive := testReleaseArchive(t, "new binary", "coop")
 	asset := fmt.Sprintf("coop_9.9.9_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
 	sum := fmt.Sprintf("%x  %s\n", sha256.Sum256(archive), asset)
@@ -94,13 +94,31 @@ func TestInstallRelease(t *testing.T) {
 		return srv.URL + "/" + tag + "/" + name
 	})()
 
-	exe := filepath.Join(t.TempDir(), "renamed-coop")
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "renamed-coop")
 	mustWrite(t, exe, "old binary")
 	before, err := os.Stat(exe)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := installRelease(exe, "v9.9.9"); err != nil {
+	staged := filepath.Join(dir, ".coop-candidate-9.9.9")
+	hash, err := stageReleaseBinary(staged, "v9.9.9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hash != fmt.Sprintf("%x", sha256.Sum256([]byte("new binary"))) {
+		t.Errorf("stage hash = %s, want the staged binary's checksum", hash)
+	}
+	if got, err := os.ReadFile(staged); err != nil || string(got) != "new binary" {
+		t.Fatalf("staged bytes = %q err=%v", got, err)
+	}
+	if info, err := os.Stat(staged); err != nil || info.Mode().Perm() != 0o755 {
+		t.Fatalf("staged mode = %v err=%v", info.Mode(), err)
+	}
+	if got, err := os.ReadFile(exe); err != nil || string(got) != "old binary" {
+		t.Fatalf("staging changed the active executable: %q err=%v", got, err)
+	}
+	if err := commitStagedBinary(staged, exe); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(exe)
@@ -115,10 +133,13 @@ func TestInstallRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	if os.SameFile(before, after) {
-		t.Error("replacement reused the old executable inode; want atomic rename")
+		t.Error("commit reused the old executable inode; want an atomic rename")
 	}
 	if after.Mode().Perm() != 0o755 {
 		t.Errorf("installed mode = %o, want 755", after.Mode().Perm())
+	}
+	if _, err := os.Stat(staged); !os.IsNotExist(err) {
+		t.Errorf("staged candidate remains after commit: %v", err)
 	}
 	wantPaths := []string{"/v9.9.9/checksums.txt", "/v9.9.9/" + asset}
 	if fmt.Sprint(paths) != fmt.Sprint(wantPaths) {
@@ -126,7 +147,7 @@ func TestInstallRelease(t *testing.T) {
 	}
 }
 
-func TestInstallReleaseFailuresKeepExecutable(t *testing.T) {
+func TestStageReleaseFailuresKeepExecutable(t *testing.T) {
 	good := testReleaseArchive(t, "new binary", "coop")
 	missingBinary := testReleaseArchive(t, "readme", "README.md")
 	asset := fmt.Sprintf("coop_9.9.9_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
@@ -151,8 +172,9 @@ func TestInstallReleaseFailuresKeepExecutable(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := installRelease(exe, "v9.9.9"); err == nil {
-				t.Fatal("want install failure")
+			staged := filepath.Join(filepath.Dir(exe), ".coop-candidate-9.9.9")
+			if _, err := stageReleaseBinary(staged, "v9.9.9"); err == nil {
+				t.Fatal("want a stage failure")
 			}
 			got, err := os.ReadFile(exe)
 			if err != nil {
@@ -163,13 +185,16 @@ func TestInstallReleaseFailuresKeepExecutable(t *testing.T) {
 				t.Fatal(err)
 			}
 			if string(got) != "old binary" || !os.SameFile(before, after) {
-				t.Errorf("failed install changed executable: bytes=%q same_inode=%v", got, os.SameFile(before, after))
+				t.Errorf("failed stage changed executable: bytes=%q same_inode=%v", got, os.SameFile(before, after))
+			}
+			if _, err := os.Stat(staged); !os.IsNotExist(err) {
+				t.Errorf("failed stage left a candidate file: %v", err)
 			}
 		})
 	}
 }
 
-func TestSelfUpdate(t *testing.T) {
+func TestResolveSelfUpdate(t *testing.T) {
 	for name, version := range map[string]string{
 		"dev build":       "dev",
 		"dirty build":     "2.7.2+dirty",
@@ -178,9 +203,9 @@ func TestSelfUpdate(t *testing.T) {
 		t.Run(name+" is a no-op without network", func(t *testing.T) {
 			defer stub(&Version, version)()
 			defer stub(&githubLatestURL, "http://127.0.0.1:1/must-not-be-called")()
-			result, err := selfUpdate()
-			if result.Outcome != selfUpdateDev || err != nil {
-				t.Fatalf("source build: outcome=%v err=%v", result.Outcome, err)
+			result, exe, err := resolveSelfUpdate()
+			if result.Outcome != selfUpdateDev || exe != "" || err != nil {
+				t.Fatalf("source build: outcome=%v exe=%q err=%v", result.Outcome, exe, err)
 			}
 		})
 	}
@@ -200,9 +225,12 @@ func TestSelfUpdate(t *testing.T) {
 		mustWrite(t, exe, "x")
 		defer stub(&executablePath, func() (string, error) { return exe, nil })()
 
-		result, err := selfUpdate()
+		result, gotExe, err := resolveSelfUpdate()
 		if result.Outcome != selfUpdateCurrent || err != nil {
 			t.Fatalf("current: outcome=%v err=%v", result.Outcome, err)
+		}
+		if want, _ := filepath.EvalSymlinks(exe); gotExe != want {
+			t.Errorf("exe = %q, want %q", gotExe, want)
 		}
 	})
 
@@ -221,7 +249,7 @@ func TestSelfUpdate(t *testing.T) {
 		mustWrite(t, exe, "ahead")
 		defer stub(&executablePath, func() (string, error) { return exe, nil })()
 
-		result, err := selfUpdate()
+		result, _, err := resolveSelfUpdate()
 		if result.Outcome != selfUpdateAhead || err != nil {
 			t.Fatalf("ahead: outcome=%v err=%v", result.Outcome, err)
 		}
@@ -233,35 +261,31 @@ func TestSelfUpdate(t *testing.T) {
 		}
 	})
 
-	t.Run("newer release installs verified archive", func(t *testing.T) {
+	t.Run("newer release resolves behind and names the tag without installing", func(t *testing.T) {
 		defer stub(&Version, "2.7.2")()
 		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			fmt.Fprint(w, `{"tag_name":"v2.7.3"}`)
 		}))
 		defer api.Close()
 		defer stub(&githubLatestURL, api.URL)()
-		archive := testReleaseArchive(t, "new", "coop")
-		asset := fmt.Sprintf("coop_2.7.3_%s_%s.tar.gz", runtime.GOOS, runtime.GOARCH)
-		sums := releaseChecksum(asset)(archive)
-		release := testReleaseServer(t, archive, sums, nil)
-		defer release.Close()
-		defer stub(&releaseFileURLFor, func(tag, name string) string {
-			return release.URL + "/" + tag + "/" + name
+		defer stub(&releaseFileURLFor, func(string, string) string {
+			t.Error("the resolver must not download artifacts")
+			return ""
 		})()
-		exeDir := t.TempDir()
-		exe := filepath.Join(exeDir, "coop")
+		exe := filepath.Join(t.TempDir(), "coop")
 		mustWrite(t, exe, "old")
 		defer stub(&executablePath, func() (string, error) { return exe, nil })()
 
-		result, err := selfUpdate()
-		if result.Outcome != selfUpdateInstalled || err != nil {
-			t.Fatalf("newer: outcome=%v err=%v", result.Outcome, err)
+		result, gotExe, err := resolveSelfUpdate()
+		if result.Outcome != selfUpdateBehind || err != nil {
+			t.Fatalf("behind: outcome=%v err=%v", result.Outcome, err)
 		}
-		if got, err := os.ReadFile(exe); err != nil || string(got) != "new" {
-			t.Errorf("verified release was not installed: bytes=%q err=%v", got, err)
+		wantExe, _ := filepath.EvalSymlinks(exe)
+		if gotExe != wantExe || result.LatestTag != "v2.7.3" || result.Latest != "2.7.3" {
+			t.Errorf("behind result = %+v exe=%q, want tag v2.7.3 and the exe path", result, gotExe)
 		}
-		if result.Current != "2.7.2" || result.Latest != "2.7.3" {
-			t.Errorf("install result = %+v, want 2.7.2 → 2.7.3", result)
+		if got, err := os.ReadFile(exe); err != nil || string(got) != "old" {
+			t.Fatalf("resolver changed the executable: bytes=%q err=%v", got, err)
 		}
 	})
 
@@ -272,7 +296,7 @@ func TestSelfUpdate(t *testing.T) {
 		}))
 		defer api.Close()
 		defer stub(&githubLatestURL, api.URL)()
-		_, err := selfUpdate()
+		_, _, err := resolveSelfUpdate()
 		var ce checkError
 		if !errors.As(err, &ce) {
 			t.Fatalf("want a checkError (soft), got %v", err)
@@ -290,45 +314,10 @@ func TestSelfUpdate(t *testing.T) {
 			t.Error("invalid release tag must not fetch artifacts")
 			return ""
 		})()
-		_, err := selfUpdate()
+		_, _, err := resolveSelfUpdate()
 		var ce checkError
 		if !errors.As(err, &ce) {
 			t.Fatalf("want a checkError (soft), got %v", err)
-		}
-	})
-
-	t.Run("unwritable location is a hard error", func(t *testing.T) {
-		if os.Geteuid() == 0 {
-			t.Skip("root ignores file permissions")
-		}
-		defer stub(&Version, "2.7.2")()
-		api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			fmt.Fprint(w, `{"tag_name":"v2.7.3"}`)
-		}))
-		defer api.Close()
-		defer stub(&githubLatestURL, api.URL)()
-		roDir := filepath.Join(t.TempDir(), "ro")
-		if err := os.Mkdir(roDir, 0o500); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) }) // so TempDir cleanup can remove it
-		exe := filepath.Join(roDir, "coop")
-		defer stub(&executablePath, func() (string, error) { return exe, nil })()
-
-		_, err := selfUpdate()
-		if err == nil {
-			t.Fatal("want an error for an unwritable install location")
-		}
-		var ce checkError
-		if errors.As(err, &ce) {
-			t.Error("unwritable should be a hard error, not a checkError")
-		}
-		var hard *installFailure
-		if !errors.As(err, &hard) || !hard.unchanged {
-			t.Errorf("err = %v, want an install failure that left the binary unchanged", err)
-		}
-		if !strings.Contains(err.Error(), "could not be replaced") {
-			t.Errorf("err = %v, want it to say the binary could not be replaced", err)
 		}
 	})
 }
